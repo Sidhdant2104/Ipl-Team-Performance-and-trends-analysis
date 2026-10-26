@@ -1,5 +1,7 @@
 """PitchIQ — IPL Win Probability & Strategy Advisor."""
 import html
+from datetime import datetime
+import pandas as pd
 import streamlit as st
 
 from src.data_loader import ROOT, load_matches, load_deliveries
@@ -7,7 +9,7 @@ from src.data_cleaning import clean_matches, clean_deliveries
 from src.pitchiq import (
     SCENARIOS, EXAMPLE_BATTER, EXAMPLE_BOWLER, calculate_match_state,
     build_historical_chase_states, empirical_chase_estimate,
-    batting_recommendations, bowling_recommendations,
+    batting_recommendations, bowling_recommendations, analysis_csv_row,
 )
 
 st.set_page_config(page_title="PitchIQ | IPL Strategy Advisor", page_icon="🏏", layout="wide")
@@ -62,7 +64,7 @@ def _set_initial_state(teams):
         "innings": "Second innings", "total_overs": 20, "score": 0, "wickets": 0,
         "overs": 0, "balls": 0, "target": 1,
         "striker": "Not specified", "non_striker": "Not specified", "bowler": "Not specified",
-        "analyzed_state": None, "analyzed_scenario": None,
+        "analyzed_state": None, "analyzed_scenario": None, "analysis_results": None,
     }
     for key, value in defaults.items():
         if key not in st.session_state:
@@ -92,7 +94,7 @@ def _apply_demo(teams, deliveries):
         first, second = _default_teams(teams)
         st.session_state.update({"batting_team": first, "bowling_team": second, "innings": "Second innings",
             "total_overs": 20, "score": 0, "wickets": 0, "overs": 0, "balls": 0, "target": 1,
-            "analyzed_state": None, "analyzed_scenario": None})
+            "analyzed_state": None, "analyzed_scenario": None, "analysis_results": None})
         _set_player("striker", "Not specified", _players_for(deliveries, first, "batter"))
         _set_player("non_striker", "Not specified", _players_for(deliveries, first, "batter"))
         _set_player("bowler", "Not specified", _players_for(deliveries, second, "bowler"))
@@ -104,7 +106,7 @@ def _apply_demo(teams, deliveries):
     for key in ["target", "score", "wickets", "overs", "balls"]:
         st.session_state[key] = template[key]
     st.session_state.update({"innings": "Second innings", "total_overs": 20,
-        "analyzed_state": None, "analyzed_scenario": scenario})
+        "analyzed_state": None, "analyzed_scenario": scenario, "analysis_results": None})
     st.session_state["striker"] = template["striker"]
     st.session_state["non_striker"] = template["non_striker"]
     st.session_state["bowler"] = template["bowler"]
@@ -112,10 +114,12 @@ def _apply_demo(teams, deliveries):
 
 def _clear_analysis():
     st.session_state["analyzed_state"] = None
+    st.session_state["analysis_results"] = None
 
 
 def _overs_changed():
     st.session_state["analyzed_state"] = None
+    st.session_state["analysis_results"] = None
     total = int(st.session_state.get("total_overs", 20))
     if int(st.session_state.get("overs", 0)) > total:
         st.session_state["overs"] = total
@@ -129,6 +133,7 @@ def _teams_changed(teams):
         st.session_state["bowling_team"] = next((team for team in teams if team != batting), "")
     # Player widget values are validated against fresh roster lists during render.
     st.session_state["analyzed_state"] = None
+    st.session_state["analysis_results"] = None
 
 
 def _reset_match(teams, deliveries):
@@ -216,9 +221,9 @@ def main():
             st.session_state[key] = "Not specified"
     st.caption("Player dropdowns list historical appearances associated with the selected franchise. They are not verified current rosters; player selection does not affect the estimate.")
     p1, p2, p3 = st.columns(3)
-    with p1: st.selectbox("Striker", list(dict.fromkeys(batter_options + [EXAMPLE_BATTER, "Not specified"])), key="striker")
-    with p2: st.selectbox("Non-striker", list(dict.fromkeys(batter_options + [EXAMPLE_BATTER, "Not specified"])), key="non_striker")
-    with p3: st.selectbox("Current bowler", list(dict.fromkeys(bowler_options + [EXAMPLE_BOWLER, "Not specified"])), key="bowler")
+    with p1: st.selectbox("Striker", list(dict.fromkeys(batter_options + [EXAMPLE_BATTER, "Not specified"])), key="striker", on_change=_clear_analysis)
+    with p2: st.selectbox("Non-striker", list(dict.fromkeys(batter_options + [EXAMPLE_BATTER, "Not specified"])), key="non_striker", on_change=_clear_analysis)
+    with p3: st.selectbox("Current bowler", list(dict.fromkeys(bowler_options + [EXAMPLE_BOWLER, "Not specified"])), key="bowler", on_change=_clear_analysis)
 
     innings_col, overs_col = st.columns(2)
     with innings_col:
@@ -250,38 +255,77 @@ def main():
 
     analyze = st.button("Analyze Match", type="primary", use_container_width=True, disabled=state is None)
     if analyze and state:
+        estimate = empirical_chase_estimate(state, historical_states) if state["status"] == "In progress" and state["innings"] == "Second innings" else None
+        if estimate:
+            prediction_status = estimate["method"]
+            key_factors = (f"Required run rate {state['required_run_rate']:.2f}; "
+                           f"{state['legal_balls_remaining']} legal balls remaining; "
+                           f"{state['wickets_remaining']} wickets remaining; "
+                           f"{estimate['sample_matches']} comparable historical matches, "
+                           f"{estimate['sample_wins']} chase wins.")
+        elif state["status"] != "In progress":
+            prediction_status = f"Prediction not applicable: {state['status']}"
+            key_factors = f"Match state status: {state['status']}."
+        elif state["innings"] == "First innings":
+            prediction_status = "Unavailable: no first-innings prediction model is included"
+            key_factors = f"First-innings score {state['score']}; {state['legal_balls_bowled']} legal balls bowled."
+        else:
+            prediction_status = "Unavailable: insufficient comparable historical states"
+            key_factors = f"Required run rate {state['required_run_rate']:.2f}; {state['legal_balls_remaining']} legal balls and {state['wickets_remaining']} wickets remaining."
+        batting_strategy = batting_recommendations(state)
+        bowling_strategy = bowling_recommendations(state)
+        generated_at = datetime.now().astimezone().isoformat(timespec="seconds")
+        match_snapshot = {
+            "scenario": scenario_name,
+            "batting_team": st.session_state.batting_team,
+            "bowling_team": st.session_state.bowling_team,
+            "striker": st.session_state.striker,
+            "non_striker": st.session_state.non_striker,
+            "bowler": st.session_state.bowler,
+        }
+        csv_row = analysis_csv_row(
+            **match_snapshot, state=state, estimate=estimate, prediction_status=prediction_status,
+            key_factors=key_factors, batting_strategy=batting_strategy,
+            bowling_strategy=bowling_strategy, generated_at=generated_at,
+        )
+        st.session_state.analysis_results = {
+            "state": state, "estimate": estimate, "match": match_snapshot,
+            "prediction_status": prediction_status, "key_factors": key_factors,
+            "batting_strategy": batting_strategy, "bowling_strategy": bowling_strategy,
+            "generated_at": generated_at, "csv_row": csv_row,
+        }
         st.session_state.analyzed_state = state
         st.session_state.analyzed_scenario = scenario_name
 
-    analyzed = st.session_state.get("analyzed_state")
-    if analyzed:
+    analysis = st.session_state.get("analysis_results")
+    analyzed = analysis["state"] if analysis else None
+    if analysis:
         st.markdown("## Match Prediction")
+        batting_name = analysis["match"]["batting_team"]
+        bowling_name = analysis["match"]["bowling_team"]
+        estimate = analysis["estimate"]
         if analyzed["status"] == "Chase complete":
-            st.success(f"Chase complete: {st.session_state.batting_team} reached the target. This is a match state, not a forecast.")
+            st.success(f"Chase complete: {batting_name} reached the target. This is a match state, not a forecast.")
         elif analyzed["status"] != "In progress":
             st.info(f"{analyzed['status']}. No ordinary win estimate is shown for a completed innings.")
         elif analyzed["innings"] != "Second innings":
             st.info("The project has no trained first-innings prediction model. Historical chase estimates are only available for second-innings states.")
+        elif estimate is None:
+            st.warning("A historical estimate is unavailable: too few comparable completed chases are present in the supplied data.")
         else:
-            estimate = empirical_chase_estimate(analyzed, historical_states)
-            if estimate is None:
-                st.warning("A historical estimate is unavailable: too few comparable completed chases are present in the supplied data.")
-            else:
-                batting_name = st.session_state.batting_team
-                bowling_name = st.session_state.bowling_team
-                batting_pct = 100 * estimate["batting_probability"]
-                bowling_pct = 100 * estimate["bowling_probability"]
-                st.caption("Empirical historical baseline — no trained model is included in this project. This estimate is not calibrated and cannot account for all match conditions.")
-                c1, c2 = st.columns(2)
-                c1.metric(f"{batting_name} · batting", f"{batting_pct:.1f}%")
-                c2.metric(f"{bowling_name} · bowling", f"{bowling_pct:.1f}%")
-                st.markdown(f'<div class="probability-bar" role="img" aria-label="Batting team {batting_pct:.1f} percent, bowling team {bowling_pct:.1f} percent"><div class="probability-bat" style="width:{batting_pct:.3f}%"></div><div class="probability-bowl" style="width:{bowling_pct:.3f}%"></div></div>', unsafe_allow_html=True)
-                st.caption(f"{batting_name}: green · {bowling_name}: charcoal")
-                st.markdown(f"**Method:** {estimate['method']} · **Comparable historical matches:** {estimate['sample_matches']} · **Chase wins in sample:** {estimate['sample_wins']}")
-                st.info(estimate["note"] + " Outcomes remain uncertain; the estimate is descriptive and may be unreliable for a state unlike the historical sample.")
-                with st.expander("Why this estimate?"):
-                    st.write(f"It compares required rate ({analyzed['required_run_rate']:.2f}), legal balls remaining ({analyzed['legal_balls_remaining']}), and wickets remaining ({analyzed['wickets_remaining']}) with the nearest unique historical match states.")
-                    st.write("Team identities, player names, current bowler, venue, weather, toss, and recent-ball text are not baseline features and do not affect this estimate.")
+            batting_pct = 100 * estimate["batting_probability"]
+            bowling_pct = 100 * estimate["bowling_probability"]
+            st.caption("Empirical historical baseline — no trained model is included in this project. This estimate is not calibrated and cannot account for all match conditions.")
+            c1, c2 = st.columns(2)
+            c1.metric(f"{batting_name} · batting", f"{batting_pct:.1f}%")
+            c2.metric(f"{bowling_name} · bowling", f"{bowling_pct:.1f}%")
+            st.markdown(f'<div class="probability-bar" role="img" aria-label="Batting team {batting_pct:.1f} percent, bowling team {bowling_pct:.1f} percent"><div class="probability-bat" style="width:{batting_pct:.3f}%"></div><div class="probability-bowl" style="width:{bowling_pct:.3f}%"></div></div>', unsafe_allow_html=True)
+            st.caption(f"{batting_name}: green · {bowling_name}: charcoal")
+            st.markdown(f"**Method:** {estimate['method']} · **Comparable historical matches:** {estimate['sample_matches']} · **Chase wins in sample:** {estimate['sample_wins']}")
+            st.info(estimate["note"] + " Outcomes remain uncertain; the estimate is descriptive and may be unreliable for a state unlike the historical sample.")
+            with st.expander("Why this estimate?"):
+                st.write(f"It compares required rate ({analyzed['required_run_rate']:.2f}), legal balls remaining ({analyzed['legal_balls_remaining']}), and wickets remaining ({analyzed['wickets_remaining']}) with the nearest unique historical match states.")
+                st.write("Team identities, player names, current bowler, venue, weather, toss, and recent-ball text are not baseline features and do not affect this estimate.")
 
         st.markdown("### Tactical Recommendations")
         bat, bowl = st.columns(2)
@@ -289,12 +333,22 @@ def main():
             with st.container(border=True):
                 st.markdown("### Batting strategy")
                 st.caption("General tactical guidance based on the entered match state.")
-                for item in batting_recommendations(analyzed): st.markdown(f"- {item}")
+                for item in analysis["batting_strategy"]: st.markdown(f"- {item}")
         with bowl:
             with st.container(border=True):
                 st.markdown("### Bowling strategy")
                 st.caption("General guidance; no player matchup advantage is assumed.")
-                for item in bowling_recommendations(analyzed): st.markdown(f"- {item}")
+                for item in analysis["bowling_strategy"]: st.markdown(f"- {item}")
+                # Strategy results are captured with the analysis so the export
+                # and visible recommendations always use the same snapshot.
+        st.download_button(
+            "⬇ Download Analysis Results (CSV)",
+            data=pd.DataFrame([analysis["csv_row"]]).to_csv(index=False),
+            file_name="pitchiq_match_analysis.csv",
+            mime="text/csv",
+            key="download_analysis_csv",
+            use_container_width=True,
+        )
         st.caption("Predictions are estimates, not guarantees. This app uses manual inputs and does not follow live matches.")
 
 

@@ -5,7 +5,6 @@ historical second-innings states from the supplied data and reports its sample.
 """
 from __future__ import annotations
 
-import math
 import numpy as np
 import pandas as pd
 
@@ -229,3 +228,31 @@ def bowling_recommendations(state):
         second = "Mix pace and length only when execution is reliable; avoid offering predictable slot balls."
     third = "Adjust the boundary riders and inner ring to the batter's scoring areas; no player-specific matchup evidence is available."
     return [first, second, third]
+
+
+def analysis_csv_row(*, scenario, batting_team, bowling_team, striker, non_striker, bowler, state, estimate, prediction_status, key_factors, batting_strategy, bowling_strategy, generated_at):
+    """Create one export row from the exact analyzed match snapshot."""
+    return {
+        "Match Scenario or Template": scenario,
+        "Batting Team": batting_team,
+        "Bowling Team": bowling_team,
+        "Striker": None if striker in (None, "", "Not specified") else striker,
+        "Non-striker": None if non_striker in (None, "", "Not specified") else non_striker,
+        "Current Bowler": None if bowler in (None, "", "Not specified") else bowler,
+        "Innings Number": 1 if state["innings"] == "First innings" else 2,
+        "Current Score": state["score"],
+        "Wickets Lost": state["wickets_lost"],
+        "Target Score": state["target"],
+        "Runs Required": state["runs_required"],
+        "Overs Completed": f"{state['overs_completed']}.{state['balls_completed']}",
+        "Legal Balls Remaining": state["legal_balls_remaining"],
+        "Current Run Rate": state["current_run_rate"],
+        "Required Run Rate": state["required_run_rate"],
+        "Batting Team Estimated Win Probability (%)": (round(100 * estimate["batting_probability"], 2) if estimate else None),
+        "Bowling Team Estimated Win Probability (%)": (round(100 * estimate["bowling_probability"], 2) if estimate else None),
+        "Prediction Model or Status": prediction_status,
+        "Key Factors Influencing Prediction": key_factors,
+        "Batting Strategy Recommendations": " | ".join(batting_strategy),
+        "Bowling Strategy Recommendations": " | ".join(bowling_strategy),
+        "Analysis Generated At": generated_at,
+    }
